@@ -1,7 +1,235 @@
 \chapter{Grundlagen}
-
-\section{Fachlicher Kontext}
-\lipsum[4]
-
+% ToDo: Placeholder Bilder durch die richtigen Bilder ersetzen (z.\,B. Fotos von GraviTrax-Elementen, Diagramme zur Kommunikationsarchitektur, etc.)
 \section{Technische Grundlagen}
-\lipsum[5]
+\subsection{GraviTrax und GraviTrax POWER}
+
+GraviTrax ist ein modulares Murmelbahnsystem der Ravensburger-Verlag GmbH, das aus geometrisch kompatiblen hexagonalen Bausteinen besteht und eine freie Konfiguration von Bahnverläufen erlaubt (siehe Abbildung~\ref{fig:basic-gravitrax-marbel-run}).
+Die Standardbausteine (z.\,B. Geraden, Kurven, Weichen und Spiralen) werden durch sogenannte \enquote{Action}-Elemente erweitert, welche aktiv in den Bewegungsablauf eingreifen und damit komplexere Streckenlogiken ermöglichen (beispielsweise magnetische Kanonen, Katapulte oder Seilrutschen-Elemente; vgl. Abbildung~\ref{fig:basic-gravitrax-elements} und Abbildung~\ref{fig:action-elements}).
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.9\textwidth]{figures/gravitrax-kugelbahn-1.jpg}
+\caption{Beispiel eines GraviTrax-Murmelbahnlaufs mit mehreren Bausteinen und Aktorelementen}
+\label{fig:basic-gravitrax-marbel-run}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.9\textwidth]{figures/gravitrax-kugelbahn-1.jpg}
+\caption{Aufreihung von Basis GraviTrax-Bausteinen (Geraden, Kurven, Weichen)}
+\label{fig:basic-gravitrax-elements}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.9\textwidth]{figures/gravitrax-kugelbahn-1.jpg}
+\caption{Aufreihung von Action-Elementen (z.\,B. magnetische Kanone, Katapult, Seilrutsche)}
+\label{fig:action-elements}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.9\textwidth]{figures/gravitrax-kugelbahn-1.jpg}
+\caption{Aufreihung von POWER-Elementen (z.\,B. Starter, Switch, Power Connect) mit Funkfähigkeit}
+\label{fig:power-elements}
+\end{figure}
+
+
+Mit der Produktlinie \enquote{GraviTrax POWER} wird das System um batteriebetriebene, elektronische Bausteine ergänzt (siehe Abbildung~\ref{fig:power-elements}).
+Diese POWER-Elemente können Zustände erfassen, Ereignisse auslösen oder auf Signale anderer Steine reagieren.
+Aus Sicht dieser Arbeit sind insbesondere (i) Trigger-Elemente relevant, die Ereignissignale erzeugen, sowie (ii) Aktor- bzw. Schaltelemente (z.\,B. \enquote{Switches}), die auf diese Signale reagieren und dadurch den Bahnverlauf oder den Systemzustand beeinflussen.
+
+\subsection[Kommunikationsarchitektur: BLE-Backhaul und 2,4 GHz-Funk]{Kommunikationsarchitektur: BLE-Backhaul und 2,4 GHz-Funk}
+Die POWER-Elemente kommunizieren untereinander über ein proprietäres Funkprotokoll im lizenzfreien 2{,}4\,GHz-ISM-Band.
+Diese Funkkommunikation ist grundsätzlich unabhängig von einer externen Bridge: Ereignisse werden von einem sendenden Stein über Funk ausgestrahlt und können von allen in Reichweite befindlichen POWER-Steinen empfangen werden.
+
+Der \enquote{Power Connect}-Stein nimmt in diesem System eine optionale Gateway-Rolle ein.
+Er dient primär dazu, eine Verbindung \enquote{nach außen} herzustellen, indem er ein externes Endgerät (z.\,B. Smartphone oder Computer) über Bluetooth Low Energy (BLE) anbindet und eingehende Steuerinformationen in Funkpakete übersetzt.
+Praktisch bedeutet dies: Anwendungen wie die GraviTrax-App können über BLE mit dem Power Connect gekoppelt werden, um anschließend Ereignisse in das Funknetz der POWER-Elemente einzuspeisen.
+Für rein interne Interaktionen zwischen POWER-Steinen (ohne externe Steuerung) ist der Power Connect hingegen nicht erforderlich.
+
+Neben diesem offenen Broadcast-Betrieb existiert ein restriktiver Betriebsmodus, der in der offiziellen Programmierschnittstelle als \enquote{Bridge Only mode} bezeichnet wird.
+In diesem Modus berücksichtigen POWER-Elemente ausschließlich Funkpakete, die als von einer Bridge (Power Connect) stammend gekennzeichnet sind; Signale anderer Steine werden verworfen.
+Die Aktivierung erfolgt durch das Senden eines LOCK-Statuscodes, die Deaktivierung durch einen UNLOCK-Statuscode (jeweils im entsprechenden Farbkanal).
+Ob ein Element im Bridge Only mode ist, lässt sich an der Farbkanal-LED erkennen: Im normalen Modus leuchtet die LED in der Farbe des Kanals (Rot, Grün oder Blau), im Bridge Only mode blinkt diese periodisch.
+Konzeptionell handelt es sich damit um eine Protokollfunktion zur Zugangsbeschränkung innerhalb des Funknetzes, die externe Steuerung über den Power Connect erzwingen kann.
+
+Für die programmgesteuerte Ansteuerung stellt der Hersteller eine Python-Bibliothek bereit.
+In der Community wurde das Verhalten des Funkprotokolls darüber hinaus durch experimentelle Analysen (\enquote{trial and error}) nachvollzogen und dokumentiert \cite{mikrocontroller2024gravitraxfunkfrequenz}.
+Diese Arbeit nutzt eine C-Referenzimplementierung \cite{github2025alramlechnerGTProtocol} als technische Grundlage, um die Struktur der Funkpakete (Protokollnachrichten) und die daraus ableitbaren Semantiken nachvollziehbar zu beschreiben.
+
+\subsection{Systemkomponenten und Funkfähigkeit}
+Die POWER-Produktlinie umfasst unterschiedliche Bauarten, deren Funkfähigkeit voneinander abweicht.
+Der Power Connect integriert einen Funkbaustein der XN297L-Familie (im Folgenden vereinfachend: \enquote{XN297L}), der die 2{,}4\,GHz-Kommunikation mit den POWER-Elementen realisiert.
+Andere POWER-Elemente (mit Ausnahme der Lichtsteine) besitzen ebenfalls einen 2{,}4\,GHz-Funktransceiver; die genaue Typbezeichnung kann je nach Bausteinvariante variieren und ist für die Protokollbeschreibung in dieser Arbeit nicht wesentlich.
+
+Die Lichtsteine sind als autarke Bausteine konzipiert und verfügen über keine Funkanbindung.
+Die Bedienung erfolgt lokal am Baustein (über einen Taster), sodass sie nicht auf Funksignale anderer Steine reagieren.
+Vereinzelt finden sich Verpackungen mit dem Hinweis auf \enquote{2{,}4\,GHz}; nach vorliegenden Informationen handelt es sich dabei um einen Fehldruck und nicht um ein Indiz für Funkfähigkeit.
+
+\subsection{Funkprotokoll: Nachrichtenformat und Semantik}
+Die untersuchten Funkpakete verwenden ein kompaktes, festes Nutzdatenformat mit 6\,Byte (Payload).
+In der C-Implementierung wird dieses Format als \enquote{Payload} aufgefasst und sowohl beim Senden als auch beim Empfangen unverändert verarbeitet.
+Die Felder lassen sich wie folgt interpretieren:
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{Byte} & \textbf{Bezeichnung} & \textbf{Bedeutung} \\
+\midrule
+1 & Kanal-/Farbcodierung & Kennzeichnet den logischen Farbkanal (Rot/Gr\"un/Blau). In der Referenzimplementierung ergibt sich der Wert als Basisoffset (0x13) plus Farbindex. \\
+2 & Senderpr\"afix & Identifiziert den sendenden Gerätetyp (z.\,B. Starter, Finish, Remote, Bridge/Connect). \\
+3 & Status-/Zielcode & Kodiert die Bedeutung des Ereignisses bzw. den adressierten Empfängertyp (z.\,B. Broadcast, Starter, Switch) sowie spezielle Steuerkommandos (z.\,B. Aktivieren/Deaktivieren eines Bridge-only-Modus). \\
+4--5 & Ereignis-ID & Pseudozufällige Kennung, die für wiederholte Aussendungen desselben Ereignisses konstant bleibt und zur Duplikaterkennung genutzt werden kann. \\
+6 & Prüfsumme & Einfache Integritätsprüfung: Summe der Bytes 1--5 modulo 256. \\
+\bottomrule
+\end{tabularx}
+\caption{Payload-Struktur der 2{,}4\,GHz-Funkpakete (abgeleitet aus der C-Referenzimplementierung)}
+\end{table}
+
+\paragraph{Duplikaterkennung und Ereignisbehandlung}
+Beim Empfangen wird die Prüfsumme neu berechnet und gegen das Prüfsummenbyte verglichen.
+Pakete mit abweichender Prüfsumme werden verworfen.
+Zur Vermeidung mehrfacher Reaktionen auf wiederholt gesendete Ereignisse wird zusätzlich eine einfache Duplikaterkennung eingesetzt: Stimmen Ereignis-ID und Prüfsumme mit dem zuletzt verarbeiteten Paket überein, wird dieses verworfen.
+
+\paragraph{Sendeverhalten und Kanalsprungverfahren}
+Für eine erhöhte Robustheit gegen Paketverlust werden Ereignisse mehrfach ausgesendet.
+Die Referenzimplementierung sendet ein identisches 6-Byte-Paket mehrfach hintereinander und wechselt dabei zwischen zwei physischen Funkkanälen pro Farbkanal.
+Für Rot, Gr\"un und Blau sind jeweils zwei RF-Kanäle hinterlegt (primär und alternativ); das Umschalten erfolgt deterministisch über die Wiederholungsnummer.
+Zwischen zwei Aussendungen ist eine kurze Wartezeit (im Millisekundenbereich) implementiert.
+
+\paragraph{Adressierung}
+Neben der Farb-/Kanalcodierung wird in der Referenzimplementierung pro Farbkanal eine eigene 5-Byte-Funkadresse verwendet.
+Damit entsteht eine logische Trennung der drei Farbkanäle, die sowohl auf Adressebene als auch auf Kanälebene abgebildet wird.
+In Kombination mit dem Status-/Zielcode lassen sich Broadcast-Nachrichten (an alle Empfänger) sowie gerichtet interpretierbare Ereignisse für bestimmte Bausteinklassen (z.\,B. \enquote{Starter} oder \enquote{Switch}) unterscheiden.
+Da Funkpakete physikalisch nicht punkt-zu-punkt zugestellt werden, erfolgt die Selektion auf Empfängerseite: Steine verwerfen empfangene Pakete, wenn sie nicht zum konfigurierten Farbkanal passen bzw. wenn der Status-/Zielcode nicht zu ihrer Rolle im System passt.
+
+\paragraph{Kodierung von Sender- und Statusfeldern (Auszug)}
+Die in Byte~2 und Byte~3 genutzten Kodierungen sind in der Referenzimplementierung als Konstanten hinterlegt.
+\Cref{tab:gt-senderpraefix} fasst die Senderpräfixe zusammen; \cref{tab:gt-statuscodes} zeigt exemplarisch ausgewählte Status-/Zielcodes, die in dieser Arbeit für die weitere Analyse relevant sind.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}l l@{}}
+\toprule
+\textbf{Wert (hex)} & \textbf{Sender (Interpretation)} \\
+\midrule
+0x02 & Finish-Element \\
+0x04 & Starter-Element \\
+0x05 & Remote/externes Bedienelement \\
+0x06 & Bridge/Connect (Power Connect) \\
+\bottomrule
+\end{tabular}
+\caption{Senderpräfixe (Byte~2) in der Referenzimplementierung}
+\label{tab:gt-senderpraefix}
+\end{table}
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{Wert (hex)} & \textbf{Name} & \textbf{Bedeutung (Interpretation)} \\
+\midrule
+0x00 & ALL & Broadcast bzw. allgemeines Ereignis \\
+0x01 & STARTER & Ereignis/Adressierung mit Bezug zum Starter \\
+0x02 & SWITCH & Ereignis/Adressierung mit Bezug zu Switch-Elementen \\
+0xC8 & UNLOCK & Steuerkommando: Deaktivieren eines restriktiven Empfangsmodus (Bridge-only) \\
+0xC9 & LOCK & Steuerkommando: Aktivieren eines restriktiven Empfangsmodus (Bridge-only) \\
+0xCA & STARTER\_PRESS & Ereignis: Starter-Tasterbetätigung \\
+\bottomrule
+\end{tabularx}
+\caption{Ausgewählte Status-/Zielcodes (Byte~3) in der Referenzimplementierung}
+\label{tab:gt-statuscodes}
+\end{table}
+
+\section{Asynchrone Programmierung in Python}
+
+\subsection{Allgemeine Motivation}
+
+Die zunehmende Bedeutung verteilter Systeme und netzwerkbasierter Anwendungen hat die Anforderungen an effiziente Nebenläufigkeitsmodelle erheblich gesteigert.
+Klassische Ansätze wie Multithreading oder Multiprocessing stoßen insbesondere bei I/O-gebundenen Operationen an Grenzen hinsichtlich Skalierbarkeit und Ressourcenverbrauch: Threads erzeugen zusätzliche Systemlast durch Kontextwechsel und erfordern komplexe Synchronisationsmechanismen, während Prozesse noch ressourcenintensiver sind.
+Vor diesem Hintergrund hat sich die asynchrone Programmierung als effiziente Alternative etabliert, insbesondere in der Programmiersprache Python durch die Einführung der Bibliothek \texttt{asyncio} \cite{hattingh2020}.
+
+\subsection{Spezifische Relevanz für Hardware-Steuerung}
+
+Besondere Bedeutung gewinnt die asynchrone Programmierung bei der Steuerung verteilter Hardware-Systeme wie GraviTrax POWER, wo die Verwaltung paralleler Kommunikationskanäle und zeitabhängiger Ereignisse zentral ist.
+Bei der gleichzeitigen Kommunikation mit dem Power Connect-Gateway über Bluetooth Low Energy (BLE) und dem Empfang von asynchronen Funkpaketen von den POWER-Elementen (vgl. Abschnitt~\ref{subsec:funkprotokoll}) müssen klassische Multithreading-Ansätze zu Problemen bei der Synchronisation und Reproduzierbarkeit führen.
+Asyncio bietet hier eine bessere Alternative durch sein kooperatives Scheduling-Modell.
+
+\subsection{Grundkonzepte der asynchronen Programmierung}
+
+Asynchrone Programmierung basiert auf dem Prinzip der nicht-blockierenden Ausführung.
+Im Gegensatz zur synchronen Programmierung, bei der Operationen sequenziell abgearbeitet werden, erlaubt dieses Paradigma die Unterbrechung von Aufgaben während Wartezeiten, um andere Operationen auszuführen.
+Zum Beispiel: Während eine Anwendung auf die Rückantwort eines Web-Requests wartet, kann die CPU interimsweise andere Tasks ausführen, statt blockierend zu warten.
+
+Das zentrale Konzept ist der \textit{Event Loop}, welcher als Scheduler fungiert und die Ausführung von sogenannten \textit{Coroutines} organisiert.
+Coroutines sind spezielle Funktionen, die mittels \texttt{async def} definiert werden und durch das Schlüsselwort \texttt{await} explizit unterbrochen werden können \cite{fowler2022}.
+Dieses kooperative Modell unterscheidet sich grundlegend von präemptiver Nebenläufigkeit, da der Kontrollfluss bewusst durch den Entwickler gesteuert wird.
+Bei GraviTrax bedeutet dies beispielsweise, dass eine Coroutine auf den Empfang eines BLE-Kommandos wartet und ihre Ausführung unterbricht (\texttt{await}), bis das Kommando eintrifft, während andere Coroutines Funkpakete von POWER-Elementen verarbeiten können.
+
+\subsection{Architektur und Komponenten von asyncio}
+
+Die Python-Bibliothek \texttt{asyncio} implementiert mehrere zentrale Abstraktionen zur Verwaltung asynchroner Operationen:
+
+\begin{description}
+\item[Event Loop] Koordiniert die Ausführung aller Tasks und verwaltet ein Warteschlangen-basiertes Scheduling-System.
+\item[Coroutine] Pausierbare Funktionseinheit, die bei Erreichen einer \texttt{await}-Anweisung kontrolliert unterbrochen werden kann.
+\item[Task] Geplante Coroutine innerhalb des Event Loops, die als eigenständige Ausführungseinheit fungiert.
+\item[Future] Repräsentation eines zukünftigen Ergebnisses, das zu einem späteren Zeitpunkt verfügbar sein wird.
+\end{description}
+
+Diese Architektur ermöglicht eine effiziente Verwaltung paralleler I/O-Operationen, ohne dass zusätzliche Threads erforderlich sind.
+Untersuchungen zeigen, dass insbesondere bei Netzwerk- und Webanwendungen signifikante Performancegewinne erzielt werden können \cite{swindell2022}.
+
+\subsection{Anwendungsbereiche und Einsatzgebiete}
+
+Asynchrone Programmierung wird vor allem in folgenden Bereichen eingesetzt:
+
+\begin{itemize}
+\item \textbf{Webserver und REST-APIs}: Serverbereiche können tausende parallele Clientverbindungen effizient handhaben, ohne dass für jeden Client ein seperater Thread notwendig ist.
+\item \textbf{Microservice-Architekturen und verteilte Systeme}: Mehrere Microservices können untereinander asynchron kommunizieren und auf gegenseitige Antworten warten, ohne Ressourcen zu verschwenden.
+\item \textbf{Echtzeit-Datenverarbeitung und Streamverarbeitung}: Kontinuierliche Datenströme (z.\,B. von Sensoren oder Netzwerkschnittstellen) können mit minimaler Latenz verarbeitet werden.
+\item \textbf{Simulation verteilter Systeme und Multi-Agenten-Szenarien}: Exemplarisch demonstrieren Avhad et al. \cite{avhad2024}, dass AsyncIO-basierte Systeme in Multi-Agenten-Simulationen eine effiziente Koordination paralleler Prozesse ermöglichen, indem sie autonome Agenten gleichzeitig ihre Aktionen koordinieren lassen.
+\item \textbf{Steuerung eingebetteter Hardware-Systeme und IoT-Geräte}: Bei GraviTrax POWER müssen mehrere I/O-intensive Aufgaben gleichzeitig verwaltet werden: (i) die BLE-basierte Kommunikation mit dem Power Connect-Gateway, (ii) der Empfang und die Verarbeitung von asynchronen Funkpaketen der POWER-Elemente (vgl. Abschnitt~\ref{subsec:funkprotokoll}), sowie (iii) die zeitgerechte Ausführung von Steuerroutinen basierend auf Ereignissen aus Trigger-Elementen.
+\end{itemize}
+
+Die letzte Kategorie ist insbesondere für diese Arbeit zentral. In modernen Low-Latency-Architekturen wird der Event-Loop-Mechanismus gezielt zur Reduktion von Verzögerungen eingesetzt \cite{umer2025}, was für die reaktive Steuerung von Murmelbahn-Elementen essentiell ist, um Verzögerungen zwischen Trigger-Ereignis und Aktor-Reaktion zu minimieren.
+
+\subsection{Vorteile und Herausforderungen}
+
+\paragraph{Vorteile}
+Ein wesentlicher Vorteil der asynchronen Programmierung liegt in der effizienten Ressourcennutzung, da keine zusätzlichen Threads erzeugt werden müssen.
+Dies reduziert Kontextwechsel und Speicherverbrauch erheblich \cite{ziade2017}, wodurch eine höhere Skalierbarkeit bei weniger Systemressourcen erreicht wird.
+Für GraviTrax bedeutet dies konkret: Eine Python-Anwendung kann parallel mit einem Power Connect kommunizieren, Funkpakete von verschiedenen POWER-Elementen verarbeiten und komplexe Steuerlogiken ausführen, ohne dass mehrere Threads verwaltet werden müssen.
+Zudem bietet das kooperative Modell bessere Vorhersagbarkeit des Programmablaufs, da Kontextwechsel nur an expliziten \texttt{await}-Punkten stattfinden.
+
+\paragraph{Herausforderungen}
+Jedoch bringt das Paradigma auch Herausforderungen mit sich.
+Die explizite Steuerung des Kontrollflusses durch \texttt{await}-Anweisungen erhöht die Komplexität des Codes und erschwert Debugging sowie Wartbarkeit, besonders wenn viele Coroutines parallel aktiv sind.
+Zudem ist die Eignung für CPU-intensive Aufgaben eingeränkt, da hier weiterhin parallele Ausfühungseinheiten (Multithreading oder Multiprocessing) erforderlich sind \cite{hattingh2020}.
+Bei komplexeren GraviTrax-Szenarien, die aufwendige Berechnungen zur Steuerroutinen-Optimierung erfordern, müsste daher eine Hybridlösung aus AsyncIO und Multiprocessing erwogen werden.
+
+\subsection{Zusammenfassung und Relevanz für diese Arbeit}
+
+\paragraph{Allgemeine Bedeutung}
+Zusammenfassend stellt die asynchrone Programmierung in Python ein leistungsfähiges Modell zur Umsetzung nebenläufiger Systeme dar, insbesondere im Kontext I/O-intensiver Anwendungen wie der Steuerung verteilter Hardware-Systeme.
+Die Bibliothek \texttt{asyncio} bietet hierfür eine strukturierte und flexible Grundlage mit well-defined Abstraktionen und klaren Kontrollfluss-Semantiken.
+Trotz ihrer Vorteile erfordert die effektive Nutzung ein fundiertes Verständnis der zugrunde liegenden Konzepte, insbesondere des Event-Loop-Mechanismus und der kooperativen Nebenläufigkeit.
+
+\paragraph{Spezifische Relevanz für GraviTrax POWER-Steuerung}
+Für die vorliegende Arbeit ist diese Kenntnis essenziell, da die Steuerung von GraviTrax POWER-Elementen über den Power Connect-Gateway die gleichzeitige Verwaltung mehrerer asynchroner Kommunikationsströme erfordert: Während BLE-Befehle an das Gateway übertragen werden, müssen parallel eingehende Funkpakete von Trigger-Elementen verarbeitet und korrespondierende Steuerroutinen ausgelöst werden.
+Das kooperative Scheduling-Modell von \texttt{asyncio} bietet hier eine ideale Balance zwischen Einfachheit (gegenüber explizitem Multithreading) und Effizienz (gegenüber blockierenden I/O-Operationen) und ermöglicht damit die Implementierung einer reaktiven, ereignisgesteuerten Steuerlogik für komplexe Murmelbahn-Konfigurationen.
+Dies wird in den folgenden Kapiteln bei der Beschreibung der Implementierung der Steuersoftware zentral sein.
+
+\section{Bluetooth Low Energy}
+Bluetooth Low Energy (BLE) stellt eine energieeffiziente Erweiterung des klassischen Bluetooth-Standards dar und wurde insbesondere für Anwendungen mit geringem Energieverbrauch und intermittierender Datenübertragung konzipiert. Charakteristisch für BLE sind kurze Übertragungsintervalle, ein reduzierter Protokoll-Overhead sowie Betriebsmodi wie Advertising und Connection Events, die eine signifikante Minimierung des Energieverbrauchs ermöglichen (Shrestha, 2016; Koulouras et al., 2025). Im Vergleich zu klassischen Bluetooth-Systemen erreicht BLE dadurch eine deutlich verlängerte Batterielebensdauer, was insbesondere für eingebettete Systeme und IoT-Anwendungen von zentraler Bedeutung ist (Ensworth & Reynolds, 2017). Die Architektur basiert auf dem Generic Attribute Profile (GATT) sowie dem Generic Access Profile (GAP), welche die Interoperabilität zwischen Geräten sicherstellen und eine flexible Kommunikation zwischen Sensoren, Aktoren und Steuergeräten ermöglichen (Aftab, 2017).
+
+Neben klassischen Einsatzgebieten wie Wearables, Smart-Home-Systemen und industriellen IoT-Lösungen findet BLE zunehmend Anwendung in interaktiven Spielsystemen. Ein Beispiel hierfür ist das modulare Kugelbahnsystem GraviTrax, bei dem BLE zur drahtlosen Kommunikation zwischen dem Power Connect Stein und dem Anwendergerät (z.\,B. Smartphone, Laptop)
+
+% ToDo: fix the BLE Text from here on
+einzelnen Bausteinen eingesetzt wird. Durch integrierte Sensoren und Aktoren können Module Zustände erfassen (z. B. das Passieren einer Kugel) und entsprechende Signale an andere Komponenten senden, wodurch sich dynamische und synchronisierte Abläufe realisieren lassen. BLE ermöglicht hierbei eine energieeffiziente, latenzarme und robuste Vernetzung der Spielmodule, ohne dass eine kabelgebundene Infrastruktur erforderlich ist. Diese Eigenschaften sind besonders relevant für batteriebetriebene Spielkomponenten, da sie eine lange Nutzungsdauer bei gleichzeitig hoher Interaktivität gewährleisten. Somit zeigt sich, dass BLE nicht nur im industriellen und wissenschaftlichen Kontext, sondern auch im Bereich intelligenter Spielzeuge eine zentrale Rolle bei der Realisierung vernetzter Systeme einnimmt (Byrne, 2023; Aftab, 2017).
+
+
+
+

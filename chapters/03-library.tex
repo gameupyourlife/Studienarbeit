@@ -1,0 +1,353 @@
+\chapter{Library-Analyse und Veränderungen}
+
+\section{Zielsetzung und Einordnung}
+Die in dieser Arbeit verwendete Python-Bibliothek \enquote{GraviTrax Connect Python Library} stellt die zentrale Softwareschicht zwischen einer externen Steueranwendung und dem GraviTrax-POWER-System dar \cite{github2023gravitraxconnectlibrary}.
+Ihre praktische Relevanz ergibt sich aus der Rolle als BLE-Gateway: Einerseits muss sie eine stabile Verbindung zur Bridge aufbauen und verwalten, andererseits eingehende und ausgehende Signale in einer Form bereitstellen, die in anwendungsnahen Steuerprogrammen mit vertretbarem Aufwand nutzbar ist.
+
+Aus wissenschaftlicher Perspektive ist die Bibliothek nicht nur ein Hilfsmittel, sondern ein Untersuchungsgegenstand.
+Die Qualität der späteren Murmelbahnsteuerungen hängt unmittelbar von ihrer Robustheit im asynchronen Laufzeitverhalten, der Konsistenz ihrer API sowie der Korrektheit der Signalauswertung ab.
+Vor diesem Hintergrund verfolgt das Kapitel drei Ziele: Erstens wird die Bibliothek in Aufbau und Funktion analysiert, zweitens wird ihre interne Architektur auf Schichten- und Ablaufebene beschrieben, und drittens werden die im Rahmen dieser Arbeit umgesetzten Änderungen einschließlich ihrer Motivation und ihres Nutzens begründet.
+
+\section{Struktur und Architektur der Bibliothek}
+Die Bibliothek ist modular aufgebaut und trennt Konfigurationswissen, Kommunikationslogik und Anwendungscode.
+Diese Trennung ist insbesondere für wissenschaftlich orientierte Weiterentwicklung relevant, da dadurch Änderungen an Protokollparametern, Laufzeitverhalten und Schnittstellenverträgen isoliert untersucht werden können.
+
+\subsection{Modulaufbau}
+Die Kernfunktionalität liegt im Paket \texttt{gravitraxconnect} mit zwei zentralen Modulen:
+\begin{itemize}
+	\item \texttt{gravitrax\_bridge.py}: Implementiert die komplette BLE-Kommunikation, Signalverarbeitung und Sende-/Empfangslogik.
+	\item \texttt{gravitrax\_constants.py}: Definiert Protokollkonstanten (UUIDs, Farbkanäle, Statuscodes, Steintypen, Batteriemapping).
+\end{itemize}
+
+Ergänzt wird dies durch:
+\begin{itemize}
+	\item Anwendungsbeispiele (Ordner \texttt{examples}),
+	\item mehrere Demo-Applikationen (CLI, GUI, GPIO, Timer, Reaction Game),
+	\item testbezogene Skripte (hardwareabhängige Funktionstests und neue hardwareunabhängige Unit-Tests).
+\end{itemize}
+
+\subsection{Architekturebenen}
+Auf konzeptioneller Ebene lässt sich die Bibliothek in vier Schichten gliedern:
+\begin{enumerate}
+	\item \textbf{Konstanten- und Protokollebene:} In \texttt{gravitrax\_constants.py} sind UUIDs, Statuscodes, Farbcodes und Steintypen zentral definiert.
+	\item \textbf{Transportebene (BLE):} Die Bibliothek kapselt die \texttt{bleak}-Funktionalität für Scanning, Verbindungsaufbau sowie GATT-Zugriffe.
+	\item \textbf{Protokoll- und Ablaufebene:} Hier werden Bytefolgen validiert, Signale konstruiert, Prüfsummen berechnet und Benachrichtigungen semantisch aufbereitet.
+	\item \textbf{Anwendungsebene:} Nutzerprogramme registrieren Callbacks und steuern die Bahn ausschließlich über die öffentliche API.
+\end{enumerate}
+
+Die Schichtung folgt damit einem klaren Entkopplungsprinzip: Low-Level-BLE-Details bleiben im Bibliothekskern verborgen, während die Anwendungsebene mit semantischen Parametern (Status, Farbe, Steintyp) arbeitet.
+Für die in dieser Arbeit entwickelte Steuerlogik ist dies zentral, da dadurch die Experimente primär auf Fachlogik und nicht auf Transportdetails fokussieren.
+
+\subsection{Kernklasse \texttt{Bridge} als Zustandscontainer}
+Die Klasse \texttt{Bridge} bildet das zentrale Abstraktionsobjekt.
+Sie kapselt den Zustand einer BLE-Verbindung inklusive Geräteidentität, Firmware-/Hardwaredaten, Callback-Referenzen und interner Synchronisationsmechanismen.
+
+Relevante Entwurfsmerkmale sind:
+\begin{itemize}
+	\item asynchrones API-Design auf Basis von \texttt{asyncio},
+	\item entkoppelte Callback-Schnittstellen für Disconnect- und Notification-Ereignisse,
+	\item Sperrmechanismen (\texttt{asyncio.Lock}) für kritische Bereiche bei Notification-Auswertung und Nachrichten-ID-Vergabe,
+	\item zusätzliche Utility-Funktionen für Scans, Prüfsummen und Logging.
+\end{itemize}
+
+Die folgende Initialisierung zeigt exemplarisch, dass Verbindungszustand, Callback-Registrierung und Synchronisationsobjekte in einem einzigen Objekt zusammengeführt werden.
+
+\begin{listing}[ht]
+\caption{Auszug: Zustandsinitialisierung der \texttt{Bridge}-Klasse}
+\label{lst:bridge-init}
+\begin{minted}{python}
+class Bridge:
+	def __init__(self):
+		self.client = None
+		self.name = None
+		self.firmware = None
+		self.hardware = None
+		self.id = 0
+		self.dc_callback = None
+		self.try_reconnect = False
+		self.restart_notifications = True
+		self.noti_callback = None
+		self.__noti_lock = asyncio.Lock()
+		self.__send_lock = asyncio.Lock()
+		self.__address = None
+		self.__next_send_id = 0
+		self.__user_disconnected = False
+		self.__last_notifications = []
+\end{minted}
+\end{listing}
+
+Methodisch bedeutet dies, dass die Bibliothek zustandsorientiert implementiert ist.
+Der Vorteil liegt in einer klaren Objektidentität für eine Bridge-Verbindung; der Nachteil ist eine stärkere Kopplung von Lebenszyklus und Laufzeitdaten innerhalb derselben Klasse.
+Für die Zielanwendung dieser Arbeit überwiegt der Vorteil, weil die Steuerung einer einzelnen aktiven Bridge der dominierende Anwendungsfall ist.
+
+\section{Funktionale Analyse}
+\subsection{Verbindungsaufbau und Lebenszyklus}
+Der Verbindungsaufbau erfolgt über \texttt{connect()}, wahlweise per Gerätename oder MAC-Adresse.
+Intern wird zunächst ein Device-Discovery-Schritt über den BLE-Scanner durchgeführt und anschließend ein \texttt{BleakClient} initialisiert.
+Nach erfolgreicher Verbindung werden Geräteinformationen (Firmware, Hardware) abgefragt.
+
+Die Trennung zwischen \texttt{connect()}, \texttt{is\_connected()} und \texttt{disconnect()} ist klar gehalten und erlaubt eine robuste Ablaufsteuerung in asynchronen Anwendungen.
+Über \texttt{dc\_callback} und optionale Reconnect-Logik kann auf Verbindungsverluste reaktiv reagiert werden.
+
+Der folgende Auszug zeigt den grundlegenden Ablauf des Verbindungsaufbaus.
+
+\begin{listing}[ht]
+\caption{Auszug: Verbindungsaufbau per Name oder Adresse}
+\label{lst:connect-flow}
+\begin{minted}{python}
+async def connect(self, name_or_addr="GravitraxConnect", by_name=True, timeout=25):
+	if by_name:
+		device = await BleakScanner.find_device_by_filter(
+			lambda d, ad: d.name and d.name.lower() == name_or_addr.lower(), timeout
+		)
+	else:
+		device = await BleakScanner.find_device_by_address(name_or_addr, timeout)
+
+	if not isinstance(device, BLEDevice):
+		return False
+
+	self.client = BleakClient(device, disconnected_callback=self.__disconnect_callback)
+	await self.client.connect(timeout=timeout)
+	self.name = device.name
+	self.__address = device.address
+	await self.request_bridge_info()
+	return True
+\end{minted}
+\end{listing}
+
+Aus Architektursicht ist hervorzuheben, dass Discovery und Verbindung nicht in separate Komponenten ausgelagert sind.
+Die Bibliothek priorisiert hier ein kompaktes API-Design gegenüber strikter Trennung.
+Für Forschungs- und Prototypingkontexte ist dies pragmatisch, da die Nutzung mit wenigen Aufrufen möglich bleibt.
+
+\subsection{Senden von Steuerinformationen}
+Für ausgehende Kommunikation existieren drei Ebenen:
+\begin{itemize}
+	\item \texttt{send\_bytes()}: Low-Level-Senden beliebiger Bytefolgen,
+	\item \texttt{send\_signal()}: Erzeugung protokollkonformer GraviTrax-Signale,
+	\item \texttt{send\_periodic()}: wiederholtes Senden mit zeitlichem Abstand.
+\end{itemize}
+
+Ein Sendesignal wird als 7-Byte-Struktur aufgebaut (Header, Steintyp, Status, Reserved, Message-ID, Checksumme, Farbkanal).
+Die Message-ID wird sequenziell oder zufällig vergeben; zusätzlich können Mehrfachsendungen (\enquote{resends}) zur Reduktion von Paketverlusten genutzt werden.
+
+Die Signalkonstruktion erfolgt explizit als Byte-Serialisierung.
+Der entsprechende Codeausschnitt macht sichtbar, dass die Message-ID-Vergabe als kritischer Abschnitt synchronisiert wird.
+
+\begin{listing}[ht]
+\caption{Auszug: Konstruktion und Versand eines GraviTrax-Signals}
+\label{lst:send-signal}
+\begin{minted}{python}
+async def send_signal(self, status, color_channel, random_id=False, stone=STONE_BRIDGE):
+	reserved = random.randrange(0, 255)
+	async with self.__send_lock:
+		if random_id:
+			message_id = random.randrange(0, 255)
+		else:
+			message_id = self.__next_send_id
+		self.__next_send_id = (self.__next_send_id + 1) % 256
+
+	checksum = (MSG_DEFAULT_HEADER + stone + status + reserved + message_id) % 256
+	await self.send_bytes(bytes([
+		MSG_DEFAULT_HEADER, stone, status, reserved, message_id, checksum, color_channel
+	]))
+\end{minted}
+\end{listing}
+
+Diese Implementierung illustriert den Entwurfsansatz der Bibliothek:
+Protokollwissen bleibt intern, die Anwendung übergibt semantische Parameter.
+Gleichzeitig ermöglicht die API mit \texttt{send\_bytes()} eine niedrigere Zugriffsebene für Experimente, was für explorative Arbeiten mit proprietären Protokollen vorteilhaft ist.
+
+\subsection{Empfang und Notification-Verarbeitung}
+Eingehende BLE-Notifications werden über \texttt{notification\_enable()} aktiviert und intern in \texttt{\_\_notification\_handler()} verarbeitet.
+Die Implementierung extrahiert mögliche GraviTrax-Signale mittels Mustererkennung, dekodiert die Felder und übergibt sie an den nutzerdefinierten Callback.
+
+Wesentliche Schutzmechanismen sind:
+\begin{itemize}
+	\item Prüfsummenvalidierung zur Erkennung fehlerhafter Pakete,
+	\item Duplikaterkennung über einen Verlauf zuletzt empfangener Signale,
+	\item Synchronisation über einen Lock, um konkurrierende Callback-Ausführungen konsistent zu halten.
+\end{itemize}
+
+Der nächste Ausschnitt zeigt den Kern der eingehenden Signalauswertung, insbesondere die Prüfsummenprüfung und das Weiterreichen nur valider Daten.
+
+\begin{listing}[ht]
+\caption{Auszug: Validierung eingehender Notifications}
+\label{lst:notification-handler}
+\begin{minted}{python}
+async def __notification_handler(self, characteristic, data):
+	message = " ".join("{:02x}".format(x) for x in data)
+	recv_signals = [m.group() for m in re.finditer(r"13(\s[0-9a-fA-F]{2}){6}", message)]
+
+	async with self.__noti_lock:
+		for recv_signal in recv_signals:
+			if recv_signal in self.__last_notifications:
+				continue
+			self.__last_notifications.append(recv_signal)
+
+			signal = [
+				int(recv_signal[0:2], 16), int(recv_signal[3:5], 16),
+				int(recv_signal[6:8], 16), int(recv_signal[9:11], 16),
+				int(recv_signal[12:14], 16), int(recv_signal[15:17], 16),
+				int(recv_signal[18:20], 16),
+			]
+
+			if signal[5] != calc_checksum(signal, for_received=True):
+				continue
+
+			await self.noti_callback(self, Header=signal[0], Stone=signal[1],
+									 Status=signal[2], Id=signal[4], Color=signal[6])
+\end{minted}
+\end{listing}
+
+Die Bibliothek folgt damit einem klaren \enquote{parse-validate-dispatch}-Muster.
+Dieses Muster ist für echtzeitnahe Steuerung zweckmäßig, da fehlerhafte Pakete früh verworfen und gültige Ereignisse mit geringer zusätzlicher Latenz an die Anwendung weitergegeben werden.
+
+\subsection{Scan- und Hilfsfunktionen}
+Die Funktion \texttt{scan\_bridges()} unterstützt die Discovery verfügbarer Bridges mit Filteroptionen, Timeout und optionalem frühzeitigem Abbruch.
+Die Utility-Funktionen \texttt{calc\_checksum()}, \texttt{add\_checksum()} und Logging-Helfer ergänzen die API um wiederverwendbare Basisbausteine.
+
+Gerade \texttt{scan\_bridges()} ist architektonisch relevant, weil diese Funktion den Übergang vom ungebundenen Systemzustand (keine Verbindung) in den adressierbaren Betriebszustand vorbereitet.
+Die in dieser Arbeit vorgenommene Überarbeitung verbessert hier die deterministische Laufzeitsteuerung (genauere Timeout-Behandlung und sauberes frühes Stoppen).
+
+\section{Identifizierte Schwachstellen vor der Überarbeitung}
+Bei der Analyse der Ausgangsbasis zeigten sich mehrere praxisrelevante Punkte:
+\begin{enumerate}
+	\item In \texttt{connect()} lieferte ein Timeout in einem Pfad keinen expliziten booleschen Rückgabewert, obwohl die Methode als \texttt{bool} konzipiert ist.
+	\item Fehlerhafte Notifications (ungültige Prüfsumme) wurden protokolliert, jedoch im selben Ablauf weiterhin an den Nutzer-Callback weitergereicht.
+	\item Die manuelle Lock-Steuerung im Sendepfad war unnötig fehleranfällig (Acquire/Release ohne Kontextmanager).
+	\item \texttt{scan\_bridges()} verlor durch Integer-Cast Timeout-Genauigkeit und setzte den Modus \texttt{stop\_on\_hit} nicht sauber um.
+	\item Logging-Handler konnten bei wiederholtem Import mehrfach angelegt werden.
+	\item Dokumentation und Metadaten waren in Teilen inkonsistent (Version, Dokumentationslink, Beispiele, Mindest-Python-Version).
+\end{enumerate}
+
+Diese Schwachstellen sind nicht unabhängig voneinander.
+Insbesondere inkonsistente Rückgabewerte, unzureichende Datenvalidierung und unpräzises Scan-Verhalten verstärken sich in asynchronen Steuerprogrammen gegenseitig:
+Fehler werden dort typischerweise nicht sofort als Ausnahme sichtbar, sondern manifestieren sich als intermittierende Laufzeitartefakte (fehlende Triggerreaktionen, nicht reproduzierbare Zustände, uneinheitliches Anwendungsverhalten).
+Die Überarbeitung zielte daher explizit auf Determinismus und beobachtbare Konsistenz.
+
+\section{Durchgeführte Änderungen und Begründung}
+Im Rahmen dieser Studienarbeit wurden die oben genannten Punkte systematisch adressiert.
+
+\subsection{Korrekturen in der Kernlogik}
+\textbf{1) Eindeutige Rückgabesemantik in \texttt{connect()}.}
+Bei einem Verbindungstimeout wird nun explizit \texttt{False} zurückgegeben.
+Dies stellt sicher, dass Aufruferverhalten (z.\,B. bedingte Ablaufsteuerungen) deterministisch bleibt.
+
+\textbf{2) Verwerfen fehlerhafter Notifications.}
+Nach erkannter Prüfsummenabweichung erfolgt nun ein \texttt{continue} im Handler.
+Damit werden beschädigte Pakete konsequent verworfen und gelangen nicht mehr in die Nutzerlogik.
+Die Änderung verbessert die Datenintegrität der Ereignisverarbeitung.
+
+\textbf{3) Sicherere Synchronisation im Sendepfad.}
+Die manuelle Sperrenverwaltung wurde durch \texttt{async with} ersetzt.
+Dadurch wird die Freigabe der Sperre auch bei Ausnahmen automatisch sichergestellt; das Risiko von Deadlocks sinkt.
+
+\textbf{4) Robusteres Scan-Verhalten.}
+\texttt{scan\_bridges()} nutzt Timeouts nun als \texttt{float} ohne Abschneiden und implementiert \texttt{stop\_on\_hit} über ein Ereignisobjekt mit \texttt{wait\_for()}.
+Gleichzeitig wird der Scanner in einem \texttt{finally}-Block stets korrekt gestoppt.
+Dies verbessert sowohl Präzision als auch Ressourcenbereinigung.
+
+\begin{listing}[ht]
+\caption{Auszug: Überarbeitetes Scan-Verhalten mit frühem Abbruch}
+\label{lst:scan-bridges}
+\begin{minted}{python}
+async def scan_bridges(name="GravitraxConnect", timeout=10.0, stop_on_hit=False):
+	timeout = float(timeout)
+	address_list = []
+	stop_event = asyncio.Event()
+
+	def discover_callback(device, advertisement_data):
+		if (device.name == name or name == "") and device.address not in address_list:
+			address_list.append(device.address)
+			if stop_on_hit:
+				stop_event.set()
+
+	scanner = BleakScanner(discover_callback, "")
+	await scanner.start()
+	try:
+		if stop_on_hit:
+			try:
+				await asyncio.wait_for(stop_event.wait(), timeout=timeout)
+			except TimeoutError:
+				pass
+		else:
+			await asyncio.sleep(timeout)
+	finally:
+		await scanner.stop()
+	return address_list
+\end{minted}
+\end{listing}
+
+\textbf{5) Korrektur von Fehlermeldungstexten.}
+In mehreren TypeError-Pfaden wurden String-Formatierungen und Meldungstexte berichtigt, damit Diagnosen im Fehlerfall eindeutig sind.
+
+\textbf{6) Vermeidung mehrfacher Logger-Handler.}
+Die Logger-Initialisierung prüft nun, ob ein benannter Stream-Handler bereits existiert.
+Damit werden doppelte Logausgaben in interaktiven oder mehrfach initialisierten Laufumgebungen vermieden.
+
+\subsection{Dokumentation und Paketmetadaten}
+Zusätzlich zur Kernlogik wurden projektbegleitende Artefakte angepasst:
+\begin{itemize}
+	\item Versionsanhebung auf \texttt{0.3.4} in \texttt{pyproject.toml},
+	\item Eintrag eines validen Dokumentationslinks,
+	\item inhaltliche Korrektur der README (Mindestversion Python 3.10, präzisere Formulierungen),
+	\item Ergänzung eines Abschnitts zur Testausführung,
+	\item Korrektur mehrerer Codebeispiele in der Bibliotheksdokumentation (insbesondere hinsichtlich Rückgabeverhalten der asynchronen Sendefunktionen).
+\end{itemize}
+
+\subsection{Qualitätssicherung durch neue Unit-Tests}
+Zur Absicherung der Änderungen wurden hardwareunabhängige Unit-Tests ergänzt.
+Diese decken insbesondere Regressionen in den kritischen Stellen ab:
+\begin{itemize}
+	\item korrektes \texttt{False} bei Connect-Timeout,
+	\item Verwerfen falscher Prüfsummen im Notification-Handler,
+	\item präzise Float-Timeout-Verwendung beim Scan,
+	\item funktionales frühzeitiges Stoppen bei \texttt{stop\_on\_hit=True}.
+\end{itemize}
+
+Durch den Einsatz von Mocks (u.\,a. für Scanner- und Client-Verhalten) sind diese Tests ohne physische Bridge ausführbar und verbessern damit die Reproduzierbarkeit im Entwicklungsprozess.
+
+Ein Beispieltest zur Prüfsummenvalidierung ist nachfolgend dargestellt.
+
+\begin{listing}[ht]
+\caption{Auszug: Unit-Test zum Verwerfen fehlerhafter Notifications}
+\label{lst:unit-test-checksum}
+\begin{minted}{python}
+async def test_notification_handler_drops_wrong_checksum(self):
+	bridge = gb.Bridge()
+	received = 0
+
+	async def callback(_bridge, **_signal):
+		nonlocal received
+		received += 1
+
+	bridge.noti_callback = callback
+	bad_signal = bytearray([0x13, 0x01, 0x02, 0x03, 0x04, 0x00, 0x01])
+	await bridge._Bridge__notification_handler(None, bad_signal)
+
+	self.assertEqual(received, 0)
+\end{minted}
+\end{listing}
+
+Auf methodischer Ebene ist bedeutsam, dass diese Tests nicht die reale BLE-Hardware ersetzen sollen, sondern eine komplementäre Prüfebene bereitstellen.
+Hardwaretests bleiben für End-to-End-Validierung notwendig; Unit-Tests sichern dagegen kontrolliert einzelne Invarianten ab.
+
+\section{Bewertung der vorgenommenen Änderungen}
+Die Änderungen adressieren keine grundlegende Neugestaltung der Bibliothek, sondern gezielte Verbesserungen in Robustheit, Korrektheit und Wartbarkeit.
+Insbesondere die Konsolidierung der Rückgabesemantik, die korrekte Behandlung beschädigter Notifications und das verbesserte Scan-Handling wirken sich direkt auf die Zuverlässigkeit von anwendungsseitigen Steuerprogrammen aus.
+
+Aus methodischer Sicht ist hervorzuheben, dass die Erweiterung um automatisierte Unit-Tests die Bibliothek von einem primär hardwarezentrierten Validierungsansatz (Funktionstests mit realer Bridge) um eine softwareseitig reproduzierbare Qualitätssicherung ergänzt.
+Damit wird die Weiterentwicklung der Bibliothek auch ohne permanente Hardwareverfügbarkeit erleichtert.
+
+Architektonisch bleibt die Bibliothek bewusst schlank und anwendungsnah.
+Die vorgenommenen Änderungen erhöhen die strukturelle Qualität, ohne das API-Paradigma zu brechen.
+Dies ist für bestehende Nutzercodes besonders vorteilhaft, weil Kompatibilität erhalten bleibt, während das Laufzeitverhalten berechenbarer wird.
+
+Für die in dieser Arbeit entwickelten Murmelbahnprogramme ergeben sich daraus zwei direkte Effekte:
+Zum einen sinkt die Wahrscheinlichkeit schwer reproduzierbarer Kommunikationsartefakte, zum anderen steigt die Aussagekraft experimenteller Ergebnisse, weil beobachtete Effekte eher auf die Fachlogik als auf Bibliotheksinstabilitäten zurückgeführt werden können.
+
+\section{Fazit des Kapitels}
+Die GraviTrax-Connect-Python-Library stellt eine funktional geeignete Grundlage für die in dieser Arbeit realisierten Murmelbahnsteuerungen dar.
+Die durchgeführten Anpassungen verbessern die Verlässlichkeit der BLE-Kommunikation, reduzieren potenzielle Fehlerquellen im asynchronen Ablauf und erhöhen die Nachvollziehbarkeit durch konsistente Dokumentation und Tests.
+
+Die überarbeitete Bibliotheksbasis bildet damit eine tragfähige Grundlage für die in den folgenden Kapiteln dargestellten anwendungsnahen Steuerlogiken und Versuchsaufbauten.

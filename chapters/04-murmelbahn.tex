@@ -1,0 +1,319 @@
+\chapter{Murmelbahnaufbauten}
+
+\section{Aufbau 1: Marbels2Binary}
+
+Der Murmelbahnaufbau \emph{Marbels2Binary} verfolgt das Ziel, die Anzahl der durch den Nutzer via dem Startblock freigegebenen Murmeln als 4-Bit-Binärzahl darzustellen. In einem Zyklus werden dabei bis zu 15 Startvorgänge erfasst (entsprechend dem Wertebereich $0$ bis $15$), die resultierende Binärdarstellung wird jedoch nicht über vier gleichzeitig sichtbare Murmeln umgesetzt, sondern über die Auswahl von bis zu vier ``repräsentativen'' Murmeln: Aus der gezählten Gesamtanzahl werden genau diejenigen Murmeln in eine Binär-Sequenz geführt, die den gesetzten Bits ($8,4,2,1$) entsprechen. Die verbleibenden Murmeln werden verworfen. Damit entsteht eine direkte, physische Repräsentation des Zählergebnisses durch die Anwesenheit der Murmeln in den vier Bit-Lanes.
+
+\subsection{Konzept und Aufbau}
+Das Gesamtsystem kombiniert eine mechanische Murmelbahn mit elektronisch ansteuerbaren GraviTrax-Connect-Elementen (insbesondere Starter, Weichen/Switches, Trigger und Kanone) sowie einer softwarebasierten Steuerung. Die Steuerung übernimmt ein Python-Skript, das über die Bridge-Schnittstelle Ereignisse (Notifications) der Bahn empfängt und im Gegenzug Schaltsignale sowie Kanonenschüsse auslöst. Der Aufbau gliedert sich funktional in (i) einen Startbereich, der die Benutzereingaben (Freigabe von Murmeln) erzeugt, (ii) einen Zähl-/Bestätigungsbereich, in dem Trigger-Signale als Rückmeldung über tatsächlich passierte Murmeln dienen, sowie (iii) einen Binär-Auswahlbereich, der die Murmeln in vier definierte Lanes (Bits $8,4,2,1$) sortiert. Abbildungen des physischen Aufbaus sind in Abbildung~X dargestellt.
+
+Eine wesentliche Randbedingung ergibt sich aus der verwendeten Hardwaretopologie: Die rote Schaltkanal-Ansteuerung beeinflusst im Aufbau sowohl eine Weiche für den ``Keep/Discard''-Ausstieg als auch die rote Weiche innerhalb der Binärselektion. Um unerwünschte Seiteneffekte zu vermeiden, arbeitet die Steuerung daher nicht mit rein phasenbasiertem Umschalten, sondern hält den Schaltzustand als Paritätszustand (``getoggelt'' vs. ``Default'') in Software nach und stellt vor jedem kritischen Schritt explizit den erwarteten Zustand her.
+
+\subsection{Funktionsweise}
+Die Steuerung des Aufbaus ist ereignisgetrieben und asynchron umgesetzt. Kernidee ist, dass die Murmelbahn einerseits physische Prozesse (Rollbewegung, Schaltzeiten der Weichen) besitzt, andererseits aber über die Bridge fortlaufend digitale Notifications liefert, die als Rückmeldung für die Steuerlogik dienen. Die Software implementiert damit eine geschlossene Regelung: Die Hardware wird angesteuert (Schalten, Schießen), und das erfolgreiche Eintreten von Teilergebnissen (``Murmel wurde gezählt'', ``Murmel hat den Keep-Pfad passiert'', ``Murmel ist in die Binärselektion eingetreten'') wird über Triggerereignisse bestätigt. Die nachfolgend erläuterten Mechanismen sind in \texttt{figures/marbels2binary\_working.py} implementiert.
+
+\subsubsection{Zustandsmodell und Notification-Verarbeitung}
+Zur Synchronisation zwischen eintreffenden Notifications und laufenden Steueraufgaben wird ein expliziter Zustand gehalten. Das Objekt \emph{ReleaseState} dient dabei sowohl als Zähler für Starter-Auslösungen als auch als Träger von Events, die auf Trigger-Rückmeldungen warten können (\emph{asyncio.Event}). Parallel wird in \emph{SwitchState} die Parität der Schaltkanäle relativ zur Default-Stellung mitgeführt, um jederzeit den aktuell angenommenen Schaltzustand explizit herstellen zu können.
+
+\begin{listing}[ht]
+\caption{Zustandsobjekte zur Zählung und zur Verfolgung der Schaltparität}
+\label{lst:state_objects}
+\begin{minted}{python}
+class ReleaseState:
+	def __init__(self, max_marbles: int):
+		self.max_marbles = max_marbles
+		self.count = 0
+		self.last_release_ts: Optional[float] = None
+		self.finished = asyncio.Event()
+		self.mode = "count_releases"
+		self.required_passes = 0
+		self.passed_count = 0
+		self.pass_event = asyncio.Event()
+		self.red_trigger_event = asyncio.Event()
+		self.green_trigger_event = asyncio.Event()
+		self.blue_trigger_event = asyncio.Event()
+		self.binary_entry_count = 0
+		self.binary_entry_event = asyncio.Event()
+
+	def add_release(self) -> None:
+		if self.count >= self.max_marbles:
+			return
+		self.count += 1
+		self.last_release_ts = time.monotonic()
+		if self.count >= self.max_marbles:
+			self.finished.set()
+
+class SwitchState:
+	def __init__(self):
+		self.red_toggled = False
+		self.green_toggled = False
+		self.blue_toggled = False
+
+	def on_toggle(self, color_channel: int) -> None:
+		if color_channel == gc.COLOR_RED:
+			self.red_toggled = not self.red_toggled
+		elif color_channel == gc.COLOR_GREEN:
+			self.green_toggled = not self.green_toggled
+		elif color_channel == gc.COLOR_BLUE:
+			self.blue_toggled = not self.blue_toggled
+\end{minted}
+\end{listing}
+
+Die eigentliche Ereignisinterpretation erfolgt in einer Notification-Callback-Funktion. Diese ordnet eingehende Notifications anhand von Header, Stone-, Status- und Color-Feldern den jeweiligen Teilprozessen zu: Starter-Events erhöhen den Release-Zähler, Trigger-Events setzen Zeitstempel und signalisieren wartenden Tasks, dass ein erwarteter Prozessschritt erfolgt ist. Gleichzeitig kann die Callback-Logik über \emph{state.mode} zwischen Zählen, Keep-Bestätigung und Binär-Eintritt umschalten.
+
+\begin{listing}[ht]
+\caption{Auszug: Notification-Callback zur Ereignisklassifikation und Rückmeldung}
+\label{lst:notification_callback}
+\begin{minted}{python}
+async def notification_callback(bridge: Any, **signal) -> None:
+	if (
+		signal.get("Header") == gc.MSG_DEFAULT_HEADER
+		and signal.get("Stone") == gc.STONE_TRIGGER
+	):
+		now = time.monotonic()
+		trigger_color = signal.get("Color")
+		if trigger_color == pass_trigger_color:
+			state.last_red_trigger_ts = now
+			state.red_trigger_event.set()
+		if trigger_color == binary_entry_trigger_color:
+			state.last_green_trigger_ts = now
+			state.green_trigger_event.set()
+		if trigger_color == blue_trigger_color:
+			state.last_blue_trigger_ts = now
+			state.blue_trigger_event.set()
+
+	if state.mode == "count_releases":
+		if not is_user_release_signal(signal, starter_color):
+			return
+		state.add_release()
+		return
+
+	if state.mode == "wait_keep_passes":
+		if not is_keep_path_pass_signal(signal, pass_trigger_color):
+			return
+		state.add_pass()
+		return
+
+	if state.mode == "wait_binary_entry":
+		if not is_binary_entry_signal(signal, binary_entry_trigger_color):
+			return
+		state.add_binary_entry()
+\end{minted}
+\end{listing}
+
+\subsubsection{Zählphase: Release Window mit Inaktivitätsende}
+Die Zählung der vom Nutzer freigegebenen Murmeln erfolgt nicht über eine fixe Eingabezeit, sondern über ein Inaktivitätskriterium. Sobald mindestens eine Murmel registriert wurde und für eine definierte Dauer keine weitere Starter-Auslösung erkannt wird, wird die Zählphase abgeschlossen. Dieses Vorgehen ist insbesondere für reale Bedienvorgänge geeignet, da Nutzer Murmeln nicht immer in konstanten Intervallen freigeben.
+
+\begin{listing}[ht]
+\caption{Auszug: Inaktivitätsbasierte Beendigung der Zählung}
+\label{lst:release_window}
+\begin{minted}{python}
+async def wait_for_release_window(state: ReleaseState, inactivity_seconds: float) -> None:
+	while not state.finished.is_set():
+		if state.count > 0 and state.last_release_ts is not None:
+			idle_for = time.monotonic() - state.last_release_ts
+			if idle_for >= inactivity_seconds:
+				state.finished.set()
+				return
+		await asyncio.sleep(0.05)
+\end{minted}
+\end{listing}
+
+Der Abschluss der Zählphase liefert die Variable \emph{released}. Daraus werden die Popcount-Anzahl der Keep-Murmeln sowie die Anzahl der zu verwerfenden Murmeln bestimmt. Der Popcount ist hierbei die Anzahl gesetzter Bits in der Binärdarstellung und entspricht damit genau der Anzahl Murmeln, die in die vier Bit-Lanes verteilt werden müssen.
+
+\begin{listing}[ht]
+\caption{Auszug: Ableitung von Keep/Discard aus der gezählten Murmelanzahl}
+\label{lst:keep_discard}
+\begin{minted}{python}
+released = counted
+binary_repr = format(released, "b")
+keep_count = released.bit_count()
+discard_count = released - keep_count
+\end{minted}
+\end{listing}
+
+\subsubsection{Binär-Mapping und Zielzustand der Weichen}
+Die Zuordnung der Bits zu den physischen Lanes erfolgt über eine feste Topologie. Aus der gezählten Zahl wird zunächst die Menge der gesetzten Bits in absteigender Reihenfolge extrahiert. Anschließend wird für jedes Bit ein Sollzustand der drei Schaltkanäle (rot, grün, blau) berechnet, der exakt eine Lane adressiert.
+
+\begin{listing}[ht]
+\caption{Auszug: Bit-Extraktion und Zuordnung auf Schaltzustände (rot, grün, blau)}
+\label{lst:bit_mapping}
+\begin{minted}{python}
+def binary_bits_desc(value: int) -> list[int]:
+	return [bit for bit in (8, 4, 2, 1) if value & bit]
+
+def target_switch_state_for_bit(bit_value: int) -> tuple[bool, bool, bool]:
+	mapping = {
+		8: (False, False, False),
+		4: (False, False, True),
+		2: (False, True, False),
+		1: (True, False, False),
+	}
+	return mapping[bit_value]
+\end{minted}
+\end{listing}
+
+Damit die Zielzustände auch unter den Bedingungen eines nicht deterministischen Hardwareverhaltens zuverlässig erreicht werden, stellt die Steuerung die Weichenstellungen nicht implizit über ``Phasenwechsel'' her, sondern vergleicht stets Ist- und Sollzustand und toggelt ausschließlich die Kanäle, die tatsächlich abweichen. Zusätzlich wird die Umschaltreihenfolge so gewählt, dass Seiteneffekte des roten Kanals möglichst spät (und nur falls erforderlich) auftreten.
+
+\begin{listing}[ht]
+\caption{Auszug: Zustandsabgleich und selektives Umschalten der Binär-Weichen}
+\label{lst:set_binary_switch_state}
+\begin{minted}{python}
+async def set_binary_switch_state(
+	bridge: Any,
+	switch_state: SwitchState,
+	target_state: tuple[bool, bool, bool],
+	switch_settle: float,
+	resends: int,
+	resend_gap: float,
+) -> tuple[bool, bool, bool]:
+	red_state, green_state, blue_state = switch_state.binary_tuple()
+	target_red, target_green, target_blue = target_state
+
+	# Toggle only changed channels to keep red-channel side effects as low as possible.
+	if blue_state != target_blue:
+		await send_switch_toggle(
+			bridge=bridge,
+			switch_state=switch_state,
+			color_channel=gc.COLOR_BLUE,
+			resends=resends,
+			resend_gap=resend_gap,
+			switch_settle=switch_settle,
+		)
+		blue_state = switch_state.blue_toggled
+
+	if green_state != target_green:
+		await send_switch_toggle(
+			bridge=bridge,
+			switch_state=switch_state,
+			color_channel=gc.COLOR_GREEN,
+			resends=resends,
+			resend_gap=resend_gap,
+			switch_settle=switch_settle,
+		)
+		green_state = switch_state.green_toggled
+
+	if red_state != target_red:
+		await send_switch_toggle(
+			bridge=bridge,
+			switch_state=switch_state,
+			color_channel=gc.COLOR_RED,
+			resends=resends,
+			resend_gap=resend_gap,
+			switch_settle=switch_settle,
+		)
+		red_state = switch_state.red_toggled
+
+	return red_state, green_state, blue_state
+\end{minted}
+\end{listing}
+
+\subsubsection{Keep-Phase: zustandssicheres Schalten mit Trigger-Feedback und Timeouts}
+Die eigentliche Sortierung erfolgt während des ``Keep''-Teils der Sequenz. Für jede Keep-Murmel wird (i) der Zielzustand der Binär-Weichen vorbereitet, (ii) eine Murmel über die Kanone ausgelassen und (iii) das erfolgreiche Passieren des Keep-Pfades per Trigger bestätigt. Bleibt diese Bestätigung aus, wird als Fehlmaßnahme automatisch ein Schaltkanal erneut getoggelt und der Versuch wiederholt. Die Notwendigkeit dieser Rückkopplung ergibt sich aus sporadischen Fehlstellungen einzelner Weichen.
+
+Eine zentrale Besonderheit liegt darin, dass die rote Schaltansteuerung im Aufbau zwei Weichen beeinflusst (Ausstieg Keep/Discard und rote Weiche der Binär-Selektion). Deshalb wird der rote Kanal nicht frühzeitig auf das Bitziel geschaltet, sondern erst nachdem durch den roten Trigger bestätigt ist, dass die Murmel den Ausstieg korrekt passiert hat. Erst danach wird der rote Kanal auf den Zielzustand für die Bit-Lane finalisiert.
+
+\begin{listing}[ht]
+\caption{Auszug: Keep-Phase mit Auto-Toggle bei fehlender Rückmeldung und späterer Finalisierung des roten Kanals}
+\label{lst:keep_phase}
+\begin{minted}{python}
+# Ensure marbles leave through keep path before each keep shot.
+if switch_state.red_toggled != keep_exit_red_toggled:
+	await send_switch_toggle(
+		bridge=bridge,
+		switch_state=switch_state,
+		color_channel=switch_toggle_color,
+		resends=resends,
+		resend_gap=resend_gap,
+		switch_settle=switch_settle,
+	)
+	auto_toggles += 1
+
+next_pass_target = state.passed_count + 1
+state.pass_event.clear()
+state.red_trigger_event.clear()
+state.mode = "wait_keep_passes"
+shot_ts = time.monotonic()
+
+await bridge.send_signal(
+	status=gc.STATUS_CANNON,
+	color_channel=gc.COLOR_RED,
+	resends=resends,
+	resend_gap=resend_gap,
+)
+
+try:
+	await asyncio.wait_for(
+		wait_for_pass_target(state, next_pass_target),
+		timeout=pass_timeout,
+	)
+except asyncio.TimeoutError:
+	await send_switch_toggle(
+		bridge=bridge,
+		switch_state=switch_state,
+		color_channel=switch_toggle_color,
+		resends=resends,
+		resend_gap=resend_gap,
+		switch_settle=switch_settle,
+	)
+	auto_toggles += 1
+	continue
+
+# Finalize only red routing after red trigger confirmation.
+if switch_state.red_toggled != target_red:
+	await send_switch_toggle(
+		bridge=bridge,
+		switch_state=switch_state,
+		color_channel=gc.COLOR_RED,
+		resends=resends,
+		resend_gap=resend_gap,
+		switch_settle=switch_settle,
+	)
+
+await asyncio.wait_for(
+	wait_for_binary_entry_target(state, next_entry_target),
+	timeout=binary_entry_timeout,
+)
+\end{minted}
+\end{listing}
+
+Nach erfolgreicher Keep-Phase werden die verbleibenden Murmeln (Discard) in einem Block über die Kanone in einen definierten Verwerfpfad geschossen. Vor dem Discard-Schritt wird dabei erneut der notwendige Ausstiegszustand hergestellt, damit keine unbestätigten ``Keep''-Murmeln mehr in der Bahn befinden und die Binär-Lanes beeinflussen können.
+
+\begin{listing}[ht]
+\caption{Auszug: Discard-Phase nach vollständiger Keep-Bestätigung}
+\label{lst:discard_phase}
+\begin{minted}{python}
+remaining = total_count - shots_sent
+if remaining > 0:
+	if switch_state.red_toggled != discard_exit_red_toggled:
+		await send_switch_toggle(
+			bridge=bridge,
+			switch_state=switch_state,
+			color_channel=switch_toggle_color,
+			resends=resends,
+			resend_gap=resend_gap,
+			switch_settle=switch_settle,
+		)
+
+	await bridge.send_periodic(
+		status=gc.STATUS_CANNON,
+		color_channel=gc.COLOR_RED,
+		count=remaining,
+		gap=cannon_gap,
+		resends=resends,
+		resend_gap=resend_gap,
+	)
+\end{minted}
+\end{listing}
+
+
+\subsection{Aufgetretene Probleme}
+
+Im praktischen Betrieb traten mehrere Probleme auf, die sowohl die Zuverlässigkeit des Systems als auch die Konzeption beeinflussten. Erstens wurde der sogenannte Bridge-only-Modus nicht durchgängig von allen Elementen korrekt erkannt. Insbesondere Weichen/Switches verblieben vereinzelt im Normalmodus und verarbeiteten Trigger-Signale autonom. Dadurch entstanden unbeabsichtigte Schaltzustände, die in der Folge zu inkonsistentem Routing und fehlerhaften Binärdarstellungen führten.
+
+Zweitens zeigte mindestens ein Switch ein sporadisches Fehlverhalten beim Umschalten. Unregelmäßig blieb die Weiche in einer Ausrichtung (insbesondere in einer linksgerichteten Stellung) hängen, obwohl ein Schaltsignal gesendet wurde. Das Problem verschwand ohne erkennbares Muster nach mehreren erneuten Schaltversuchen, führte in der Zwischenzeit jedoch zu nicht deterministischem Systemverhalten. Für die Steuerung bedeutete dies, dass rein offene-loop (d.~h. ohne Rückmeldung) ausgeführte Schaltsequenzen nicht ausreichen; die im Skript implementierte Strategie mit Trigger-Feedback, Timeouts und automatischem Nachschalten ist eine direkte Reaktion auf diese Beobachtung.
+
+Drittens erwies sich in der Konzeptionsphase das Fehlen eines dedizierten ``Stop-'' bzw. Gate-Elements als limitierend. Für eine zuverlässige Signalauslösung wäre es vorteilhaft gewesen, Murmeln an definierten Stellen zu puffern und kontrolliert einzeln freizugeben. Ein solches Element existiert im verwendeten System nicht in der gewünschten Form. Als funktionaler Ersatz kann die elektronische Kanone genutzt werden, da sie Murmeln einzeln freigibt und mit hoher Frequenz (typischerweise etwa 250~ms pro Murmel) auslösen kann. Gleichzeitig erzeugt die Kanone jedoch einen Impuls, sodass die Anfangsgeschwindigkeit der Murmeln aktiv berücksichtigt werden muss. In der Praxis erforderte dies eine geeignete Zuführung, damit Murmeln weder zu schnell in die Kanone rollen (und auf der Gegenseite zurückrollen) noch zu langsam bzw. unter zu geringem Gefälle ankommen (und die Kanone nicht erreichen). Das mitgelieferte Anstell-Element (vgl. Abbildung~X) stellte hierfür eine praktikable Lösung dar, da es einen halben Höhenblock überbrückt und damit ein Verklemmen beim Anstellen reduziert.
+
+Viertens erwies sich der Lever nicht als geeignetes Stop-Element. Bei mehreren anstehenden Murmeln stößt der Lever beim Auslösen die gesamte Murmelreihe zurück; dabei geht mit zunehmender Anzahl an Murmeln mechanische Energie verloren. Abhängig von der Länge der Warteschlange konnte dies dazu führen, dass nachfolgende Elemente nicht mehr sicher erreicht wurden und die Murmelbahn in einem Stillstand endete.
+

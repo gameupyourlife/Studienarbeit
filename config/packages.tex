@@ -1,7 +1,6 @@
 \usepackage[T1]{fontenc}
 \usepackage[utf8]{inputenc}
 \usepackage[ngerman]{babel}
-\usepackage{csquotes}
 
 \usepackage[a4paper,left=30mm,right=25mm,top=25mm,bottom=30mm]{geometry}
 \usepackage{setspace}
@@ -15,6 +14,17 @@
 
 \usepackage{amsmath}
 \usepackage{amssymb}
+
+\usepackage[newfloat]{minted}
+\setminted{
+	fontsize=\small,
+	breaklines=true,
+	obeytabs=true,
+	tabsize=4,
+	encoding=utf8
+}
+
+\usepackage{csquotes}
 
 \usepackage[hidelinks]{hyperref}
 \usepackage[capitalise,nameinlink]{cleveref}
